@@ -21,7 +21,7 @@ python3 -m venv env_recsys_start
 После его инициализации следующей командой
 
 ```
-. env_recsys_start/bin/activate
+. .venv/bin/activate
 ```
 
 установите в него необходимые Python-пакеты следующей командой
