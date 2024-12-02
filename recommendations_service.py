@@ -1,147 +1,242 @@
-import numpy as np
+import logging
 import pandas as pd
-import joblib
+from contextlib import asynccontextmanager
+from typing import List
 from fastapi import FastAPI
-from scipy import sparse
-from sklearn.metrics.pairwise import cosine_similarity
 
-app = FastAPI()
-
-# Загрузка модели и кодировщиков
-als_i2i_model = joblib.load('als_i2i_model.pkl')
-als_model = joblib.load('als_model.pkl')
-events = pd.read_parquet('data/events.parquet')
-data = pd.read_parquet('data/items.parquet')
-merged = events.merge(data, on='track_id', how='left')
+logger = logging.getLogger("uvicorn.error")
 
 
-def get_top_contents() -> list:
-    df = pd.read_parquet('data/top_popular.parquet')
-    top_tracks = df['track_id'].unique()
-    return top_tracks
+class Recommendations:
+
+    def __init__(self):
+
+        self._recs = {"personal": None, "online": None, "default": None}
+        self._stats = {
+            "request_personal_count": 0,
+            "request_default_count": 0,
+        }
+
+    def load(self, type_rec, path, **kwargs):
+        """
+        Загружает рекомендации из файла
+        """
+        logger.info(f"Loading recommendations, type: {type_rec}")
+        self._recs[type_rec] = pd.read_parquet(path)
+        self._recs[type_rec] = self._recs[type_rec]
+        logger.info(f"Loaded")
+
+    def get(self, user_id: int, k: int = 100):
+        """
+        Возвращает список рекомендаций для пользователя
+        """
+        recs = {
+            "personal": [],
+            "default": []
+        }
+
+        personal_recs = self._recs["personal"][self._recs["personal"]["user_id"] == user_id]
+        recs["personal"] = personal_recs["track_id"].to_list()[:k]
+
+        # Если нет персональных рекомендаций - возвращает рекомендации из топ 100
+        if len(recs["personal"]) == 0:
+            self.load(type_rec="default",
+                      path="data/top_popular.parquet",
+                      columns=["track_id"],
+                      )
+            default_recs = self._recs["default"]
+            recs["default"] = default_recs["track_id"].to_list()[:k]
+
+        return recs
+
+    def stats(self):
+
+        logger.info("Stats for recommendations")
+        for name, value in self._stats.items():
+            logger.info(f"{name:<30} {value} ")
+
+        logger.info("Done")
 
 
-# Функция для получения истории пользователя
-def get_history(user_id, all_data):
-    df = pd.read_parquet('data/events.parquet')
-    df = df[df['user_id'] == user_id]
-    last_two_months = df['started_at'].max() - pd.DateOffset(months=2)
-    df = df[df['started_at'] > last_two_months]
-    return df.merge(all_data, on='track_id', how='left')
+class SimilarItems:
+
+    def __init__(self):
+
+        self._similar_items = None
+
+    def load(self, path, type="online", **kwargs):
+        """
+        Загружаем данные из файла
+        """
+
+        logger.info(f"Loading data, type: {type}")
+        self._similar_items = pd.read_parquet(path)
+        logger.info(f"Loaded")
+
+    def get(self, item_id: int, k: int = 10):
+        """
+        Возвращает список похожих объектов
+        """
+        try:
+            print(self._similar_items)
+            i2i = self._similar_items[self._similar_items["track_id"] == item_id].head(k)
+            i2i = i2i[["similar_track_id"]].to_dict(orient="list")
+        except KeyError as e:
+            logger.error(e)
+            i2i = {"track_id": [], "similar_track_id": []}
+
+        return i2i
 
 
-def get_sparse_matrix_csr():
-    # Создание разреженной матрицы взаимодействия
-    interaction_matrix = merged.groupby(['user_id', 'track_id']).size().unstack(fill_value=0)
+class EventStore:
 
-    # Преобразование индексов в NumPy массивы
-    user_ids = interaction_matrix.index.to_numpy()
-    track_ids = interaction_matrix.columns.to_numpy()
+    def __init__(self, max_events_per_user=10):
+        self.events = {}
+        self.max_events_per_user = max_events_per_user
 
-    # Создание отображения для преобразования идентификаторов в индексы
-    user_id_to_index = {id: index for index, id in enumerate(user_ids)}
-    track_id_to_index = {id: index for index, id in enumerate(track_ids)}
+    def put(self, user_id: int, item_id: int):
+        """
+        Сохраняет событие.
+        Если пользователь уже имеет события, добавляем новое событие в начало списка.
+        Если количество событий превышает максимальное значение, удаляем старые.
+        """
+        if user_id not in self.events:
+            self.events[user_id] = []
 
-    # Создание разреженной матрицы взаимодействия
-    rows = []
-    cols = []
-    data = []
+        # Добавляем новое событие
+        user_events = self.events[user_id]
+        user_events.insert(0, item_id)  # Добавляем новое событие в начало списка
 
-    for (user_id, track_id), count in interaction_matrix.stack().items():
-        rows.append(user_id_to_index[user_id])
-        cols.append(track_id_to_index[track_id])
-        data.append(count)
+        # Ограничиваем количество событий до max_events_per_user
+        self.events[user_id] = user_events[:self.max_events_per_user]
 
-    # Преобразование в NumPy массивы
-    rows_np = np.array(rows, dtype=np.int32)
-    cols_np = np.array(cols, dtype=np.int32)
-    data_np = np.array(data, dtype=np.float32)
-
-    # Создание разреженной матрицы в формате COO
-    sparse_matrix = sparse.coo_matrix((data_np, (rows_np, cols_np)),
-                                      shape=(len(user_ids), len(track_ids)))
-
-    # Преобразование в формат CSR для эффективной индексации
-    sparse_matrix_csr = sparse_matrix.tocsr()
-    return sparse_matrix_csr, track_ids
+    def get(self, user_id: int, k: int) -> List[int]:
+        """
+        Возвращает события для пользователя.
+        Если пользователь не имеет событий, возвращаем пустой список.
+        """
+        return self.events.get(user_id, [])[:k]
 
 
-def personal_recommendations(user_id, model_personal, history_df) -> list:
-    # Создание списка для хранения рекомендаций и прослушанных значений
-    user_id_to_index = {id: index for index, id in enumerate([user_id])}
-    recommendations = []
-    true_labels = []
-
-    sparse_matrix_csr, track_ids = get_sparse_matrix_csr()
-    user_index = user_id_to_index[user_id]
-    recommended = model_personal.recommend(user_index, sparse_matrix_csr[user_index], N=10)
-
-    # Извлекаем индексы треков и их оценки
-    track_indices, scores = recommended
-
-    # Сохраняем рекомендации
-    for track_index in track_indices:
-        recommendations.append(
-            (user_id, track_ids[track_index]))  # track_ids[track_index] возвращает идентификатор трека
-
-    # Сохраняем истинные значения (треки, которые пользователь прослушал)
-    true_tracks = [history_df['user_id'] == user_id]['track_id'].values
-    true_labels.extend([(user_id, track) for track in true_tracks])
-
-    # Создание DataFrame с рекомендациями
-    recommendations_df = pd.DataFrame(recommendations, columns=['user_id', 'track_id'])
-
-    return recommendations_df['track_id'].to_list()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    sim_items_store.load(
+        type_rec="online",
+        path="data/similar.parquet",
+        columns=["track_id", "similar_track_id"],
+    )
+    logger.info("Ready!")
+    yield
 
 
-def online_recommendations(history_df, model):
-    # Формируем список треков из истории пользователя
-    tracks = history_df['track_id']
-    encoder_track = joblib.load('encoder_track.pkl')
-    track_ids = encoder_track.classes_
-    item_factors = model.item_factors
-
-    def get_similar_tracks(track_id, track_factors_df, n=5):
-        # Функция для получения похожих треков
-        if track_id not in track_factors_df.index:
-            return []
-        # Вычисляем схожесть между векторами факторов
-        similarities = cosine_similarity(track_factors_df.loc[[track_id]], track_factors_df).flatten()
-        # Получаем индексы наиболее схожих треков
-        similar_indices = np.argsort(similarities)[::-1][1:n + 1]  # Исключаем сам трек
-        # Возвращаем список похожих треков
-        similar_tracks = track_factors_df.index[similar_indices].tolist()
-        return similar_tracks
-
-    results = [
-        similar_track
-        for track in tracks
-        for similar_track in get_similar_tracks(track, pd.DataFrame(item_factors, index=track_ids))
-    ]
-    return results
+app = FastAPI(title="features", lifespan=lifespan)
+events_store = EventStore()
+sim_items_store = SimilarItems()
 
 
-@app.get("/recommendations/{user_id}")
-def run(user_id):
-    history_df = get_history(user_id=user_id, all_data=data)
-    if history_df.empty:
-        print(f'Новый пользователь')
-        result = get_top_contents()
-        print(len(result))
-        return result
-    elif history_df['track_id'].nunique() < 50:
-        print(f'Формируем персональные рекомендации')
-        results = personal_recommendations(user_id, als_model)
-        return results
-    else:
-        print(f'Формируем персональные и онлайн рекомендации')
-        online = online_recommendations(user_id, history_df, als_i2i_model)
-        personal = personal_recommendations(user_id, als_model)
-        results = online + personal
-    return results
+@app.post("/similar_items")
+async def online_recommendations(item_id: int, k: int = 10):
+    """
+    Возвращает список похожих объектов длиной k для item_id
+    """
+    i2i = sim_items_store.get(item_id, k)
+    return i2i
 
 
-# Пример вызова функции (для тестирования)
-if __name__ == "__main__":
-    print(run(user_id=592357592357))
-    #print(run(592357))
+@app.post("/put")
+async def put(user_id: int, item_id: int):
+    """
+    Сохраняет событие для user_id, item_id
+    """
+
+    events_store.put(user_id, item_id)
+
+    return {"result": "ok"}
+
+
+@app.post("/get")
+async def get(user_id: int, k: int = 10):
+    """
+    Возвращает список последних k событий для пользователя user_id
+    """
+
+    events = events_store.get(user_id, k)
+
+    return {"events": events}
+
+
+def dedup_ids(ids):
+    """
+    Дедублицирует список идентификаторов, оставляя только первое вхождение
+    """
+    seen = set()
+    ids = [id for id in ids if not (id in seen or seen.add(id))]
+
+    return ids
+
+
+@app.post("/recommendations_online")
+async def recommendations_online(user_id: int, k: int = 100):
+    """
+    Возвращает список онлайн-рекомендаций длиной k для пользователя user_id
+    """
+    # получаем последнее событие пользователя
+    resp = await get(user_id, k=k)
+    print(resp)
+    events = resp["events"]
+    results = []
+    # получаем список похожих объектов
+    if len(events) > 0:
+        for event in events:
+            result = await online_recommendations(item_id=event, k=k)
+            print(result)
+            results += result.get('similar_track_id')
+    return {"recs": results}
+
+
+@app.post("/recommendations_offline")
+async def recommendations_offline(user_id: int, k: int = 100):
+    """
+    Возвращает список рекомендаций длиной k для пользователя user_id
+    """
+    rec_store = Recommendations()
+    rec_store.load(type_rec="personal",
+                   path="data/personal.parquet",
+                   columns=["user_id", "track_id"],
+                   )
+    recs = rec_store.get(user_id, k)
+    flat_recs = [track for sublist in recs.values() for track in sublist]
+    return {"recs": flat_recs}
+
+
+@app.post("/recommendations")
+async def recommendations(user_id: int, k: int = 100):
+    """
+    Возвращает список рекомендаций длиной k для пользователя user_id
+    """
+
+    recs_offline = await recommendations_offline(user_id, k)
+    recs_online = await recommendations_online(user_id, k)
+
+    recs_offline = recs_offline["recs"]
+    recs_online = recs_online["recs"]
+
+    recs_blended = []
+
+    min_length = min(len(recs_offline), len(recs_online))
+    # чередуем элементы из списков, пока позволяет минимальная длина
+    for i in range(min_length):
+        recs_blended.append(recs_online[i])
+        recs_blended.append(recs_offline[i])
+
+    # добавляем оставшиеся элементы в конец
+    recs_blended += recs_online[min_length:]
+    recs_blended += recs_offline[min_length:]
+
+    # удаляем дубликаты
+    recs_blended = dedup_ids(recs_blended)
+
+    # оставляем только первые k рекомендаций
+    recs_blended = recs_blended[:k]
+
+    return {"recs": recs_blended}
