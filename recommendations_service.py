@@ -3,8 +3,51 @@ import pandas as pd
 from contextlib import asynccontextmanager
 from typing import List
 from fastapi import FastAPI
+import boto3
+from botocore.config import Config
+from dotenv import load_dotenv
+import os
+import io
+
+load_dotenv()
+
+bucket_name = 's3-student-mle-20240822-03e9c191e2'
+ENDPOINT = "https://storage.yandexcloud.net"
+aws_access_key_id = f"{os.getenv('AWS_ACCESS_KEY_ID')}"
+aws_secret_access_key = f"{os.getenv('AWS_SECRET_ACCESS_KEY')}"
+print(aws_access_key_id)
+print(aws_secret_access_key)
+
+s3 = boto3.client(
+        "s3",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        verify=False,
+    )
+response = s3.get_object(Bucket=bucket_name, Key='recsys/recommendations/personal_als.parquet')
+buffer = io.BytesIO(response['Body'].read())
+df = pd.read_parquet(buffer)
+print(df)
 
 logger = logging.getLogger("uvicorn.error")
+
+print(os.getenv('AWS_ACCESS_KEY_ID'))
+print(os.getenv('AWS_SECRET_ACCESS_KEY'))
+
+def get_data_s3(path):
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+        config=Config(signature_version='s3v4'),
+        verify=False,
+    )
+    response = s3.get_object(Bucket=BUCKET_NAME, Key=path)
+    buffer = io.BytesIO(response['Body'].read())
+    df = pd.read_parquet(buffer)
+    return df
 
 
 class Recommendations:
@@ -22,7 +65,7 @@ class Recommendations:
         Загружает рекомендации из файла
         """
         logger.info(f"Loading recommendations, type: {type_rec}")
-        self._recs[type_rec] = pd.read_parquet(path)
+        self._recs[type_rec] = get_data_s3(path)
         self._recs[type_rec] = self._recs[type_rec]
         logger.info(f"Loaded")
 
@@ -35,13 +78,15 @@ class Recommendations:
             "default": []
         }
 
+        print(self._recs["personal"])
         personal_recs = self._recs["personal"][self._recs["personal"]["user_id"] == user_id]
         recs["personal"] = personal_recs["track_id"].to_list()[:k]
 
         # Если нет персональных рекомендаций - возвращает рекомендации из топ 100
         if len(recs["personal"]) == 0:
+            logger.info('No personal')
             self.load(type_rec="default",
-                      path="data/top_popular.parquet",
+                      path="recsys/recommendations/top_popular.parquet",
                       columns=["track_id"],
                       )
             default_recs = self._recs["default"]
@@ -201,7 +246,7 @@ async def recommendations_offline(user_id: int, k: int = 100):
     """
     rec_store = Recommendations()
     rec_store.load(type_rec="personal",
-                   path="data/personal.parquet",
+                   path="recsys/recommendations/personal_als.parquet",
                    columns=["user_id", "track_id"],
                    )
     recs = rec_store.get(user_id, k)
@@ -210,7 +255,7 @@ async def recommendations_offline(user_id: int, k: int = 100):
 
 
 @app.post("/recommendations")
-async def recommendations(user_id: int, k: int = 100):
+async def recommendations(user_id: int, k: int = 200):
     """
     Возвращает список рекомендаций длиной k для пользователя user_id
     """
@@ -236,7 +281,4 @@ async def recommendations(user_id: int, k: int = 100):
     # удаляем дубликаты
     recs_blended = dedup_ids(recs_blended)
 
-    # оставляем только первые k рекомендаций
-    recs_blended = recs_blended[:k]
-
-    return {"recs": recs_blended}
+    return {"recs": recs_blended[:k]}
