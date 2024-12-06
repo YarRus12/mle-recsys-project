@@ -4,19 +4,16 @@ from contextlib import asynccontextmanager
 from typing import List
 from fastapi import FastAPI
 import boto3
-from botocore.config import Config
 from dotenv import load_dotenv
 import os
 import io
 
 load_dotenv()
 
-bucket_name = 's3-student-mle-20240822-03e9c191e2'
+BUCKET_NAME = 's3-student-mle-20240822-03e9c191e2'
 ENDPOINT = "https://storage.yandexcloud.net"
 aws_access_key_id = f"{os.getenv('AWS_ACCESS_KEY_ID')}"
 aws_secret_access_key = f"{os.getenv('AWS_SECRET_ACCESS_KEY')}"
-print(aws_access_key_id)
-print(aws_secret_access_key)
 
 s3 = boto3.client(
         "s3",
@@ -25,25 +22,12 @@ s3 = boto3.client(
         aws_secret_access_key=aws_secret_access_key,
         verify=False,
     )
-response = s3.get_object(Bucket=bucket_name, Key='recsys/recommendations/personal_als.parquet')
-buffer = io.BytesIO(response['Body'].read())
-df = pd.read_parquet(buffer)
-print(df)
 
 logger = logging.getLogger("uvicorn.error")
 
-print(os.getenv('AWS_ACCESS_KEY_ID'))
-print(os.getenv('AWS_SECRET_ACCESS_KEY'))
 
 def get_data_s3(path):
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=ENDPOINT,
-        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-        config=Config(signature_version='s3v4'),
-        verify=False,
-    )
+
     response = s3.get_object(Bucket=BUCKET_NAME, Key=path)
     buffer = io.BytesIO(response['Body'].read())
     df = pd.read_parquet(buffer)
@@ -60,7 +44,7 @@ class Recommendations:
             "request_default_count": 0,
         }
 
-    def load(self, type_rec, path, **kwargs):
+    async def load(self, type_rec, path, **kwargs):
         """
         Загружает рекомендации из файла
         """
@@ -69,7 +53,7 @@ class Recommendations:
         self._recs[type_rec] = self._recs[type_rec]
         logger.info(f"Loaded")
 
-    def get(self, user_id: int, k: int = 100):
+    async def get(self, user_id: int, k: int = 100):
         """
         Возвращает список рекомендаций для пользователя
         """
@@ -78,14 +62,13 @@ class Recommendations:
             "default": []
         }
 
-        print(self._recs["personal"])
         personal_recs = self._recs["personal"][self._recs["personal"]["user_id"] == user_id]
         recs["personal"] = personal_recs["track_id"].to_list()[:k]
 
         # Если нет персональных рекомендаций - возвращает рекомендации из топ 100
         if len(recs["personal"]) == 0:
             logger.info('No personal')
-            self.load(type_rec="default",
+            await self.load(type_rec="default",
                       path="recsys/recommendations/top_popular.parquet",
                       columns=["track_id"],
                       )
@@ -123,7 +106,6 @@ class SimilarItems:
         Возвращает список похожих объектов
         """
         try:
-            print(self._similar_items)
             i2i = self._similar_items[self._similar_items["track_id"] == item_id].head(k)
             i2i = i2i[["similar_track_id"]].to_dict(orient="list")
         except KeyError as e:
@@ -227,14 +209,12 @@ async def recommendations_online(user_id: int, k: int = 100):
     """
     # получаем последнее событие пользователя
     resp = await get(user_id, k=k)
-    print(resp)
     events = resp["events"]
     results = []
     # получаем список похожих объектов
     if len(events) > 0:
         for event in events:
             result = await online_recommendations(item_id=event, k=k)
-            print(result)
             results += result.get('similar_track_id')
     return {"recs": results}
 
@@ -245,11 +225,11 @@ async def recommendations_offline(user_id: int, k: int = 100):
     Возвращает список рекомендаций длиной k для пользователя user_id
     """
     rec_store = Recommendations()
-    rec_store.load(type_rec="personal",
+    await rec_store.load(type_rec="personal",
                    path="recsys/recommendations/personal_als.parquet",
                    columns=["user_id", "track_id"],
                    )
-    recs = rec_store.get(user_id, k)
+    recs = await rec_store.get(user_id, k)
     flat_recs = [track for sublist in recs.values() for track in sublist]
     return {"recs": flat_recs}
 
